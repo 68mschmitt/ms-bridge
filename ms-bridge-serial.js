@@ -1,14 +1,19 @@
-// ms-bridge-serial.js (resilient version)
-// - Opens MS2 serial, polls OutputChannels using ochGetCommand from the .ini,
-// - Parses RPM (U16 BE) and publishes frames over WebSocket,
-// - Auto-reconnects on failures and on "no data" timeouts.
+// ms-bridge-serial.js  —  MS2/Extra Serial → WebSocket (RPM) bridge
+// - Robust: auto-discover, auto-reconnect, no-data watchdog
+// - Decoding: uses mainController.ini (ochGetCommand, ochBlockSize, rpm offset/type/scale)
+// - Endianness: defaults to INI's "big", auto-falls back to LE if implausible; flags to force
+// - WebSocket: ws://<host>:<port>/v1/stream  (frames: {type:"frame", ts, data:{ rpm }})
+// - HTTP:      /v1/channels, /v1/snapshot, /v1/health
 
 import fs from "fs";
 import http from "http";
 import { WebSocketServer } from "ws";
-import { SerialPort } from "serialport";
-import { list as listSerial } from "serialport";
 import ini from "ini";
+
+// serialport is CommonJS on many Pi builds; use default import & destructure:
+import serialPkg from "serialport";
+const { SerialPort } = serialPkg;
+const listSerial = async () => SerialPort.list();
 
 // ------------------ CLI / ENV ------------------
 const args = Object.fromEntries(process.argv.slice(2).map(a => {
@@ -16,85 +21,69 @@ const args = Object.fromEntries(process.argv.slice(2).map(a => {
   return [k.replace(/^--/, ""), v ?? true];
 }));
 
-let SERIAL_PORT = args.port || process.env.MS_PORT || "";     // if empty, auto-discover
+let SERIAL_PORT = args.port || process.env.MS_PORT || "";     // auto-discover if empty
 const BAUD = Number(args.baud || process.env.MS_BAUD || 115200);
 const INI_PATH = args.ini || process.env.MS_INI;
 const WS_PORT = Number(args.wsport || process.env.WS_PORT || 8765);
-const POLL_MS = Number(args.poll || process.env.POLL_MS || 50);      // ~20Hz
-const NO_DATA_TIMEOUT_MS = Number(args.nodata || 3000);              // watchdog for silent links
+const POLL_MS = Number(args.poll || process.env.POLL_MS || 50);          // ~20 Hz
+const NO_DATA_TIMEOUT_MS = Number(args.nodata || 3000);                  // watchdog for silent links
 const MAX_BACKOFF_MS = 8000;
 
-// Optional USB VID/PID filters for auto-discovery
-const USB_VID = (args.vid || process.env.MS_USB_VID || "").toLowerCase();    // e.g. "0403"
-const USB_PID = (args.pid || process.env.MS_USB_PID || "").toLowerCase();    // e.g. "6001"
+const FORCE_ENDIAN = (args.endian || "").toLowerCase(); // "le" | "be" | ""
+const RPM_OFFSET_OVERRIDE = (args.rpmOffset !== undefined) ? Number(args.rpmOffset) : null;
+const RPM_SCALE_OVERRIDE  = (args.rpmScale  !== undefined) ? Number(args.rpmScale)  : null;
+const DEBUG = !!args.debug;
+
+// Optional VID/PID filters for discovery
+const USB_VID = (args.vid || process.env.MS_USB_VID || "").toLowerCase();
+const USB_PID = (args.pid || process.env.MS_USB_PID || "").toLowerCase();
 
 if (!INI_PATH) {
-  console.error("Missing --ini=/path/to/firmware.ini (MS2/Extra .ini with OutputChannels).");
+  console.error("Missing --ini=/path/to/mainController.ini");
   process.exit(1);
 }
 
-// ------------------ .ini parsing ------------------
+// ------------------ Parse INI ------------------
 const rawIni = fs.readFileSync(INI_PATH, "utf8");
 
 // ochBlockSize
 const ochBlockSize = (() => {
   const m = rawIni.match(/^\s*ochBlockSize\s*=\s*(\d+)/mi);
-  if (!m) throw new Error("ochBlockSize not found in .ini");
+  if (!m) throw new Error("ochBlockSize not found in INI");
   return parseInt(m[1], 10);
 })();
 
-// ochGetCommand (e.g. "a\x00\x06")
+// ochGetCommand (quoted, may include escapes like \x06)
 const ochGetCmdStr = (() => {
   const m = rawIni.match(/^\s*ochGetCommand\s*=\s*"([^"]+)"/mi);
-  if (!m) throw new Error("ochGetCommand not found in .ini");
+  if (!m) throw new Error("ochGetCommand not found in INI");
   return m[1];
 })();
 
-// ---- INI parsing for RPM (type, offset, scale, translate)
+// INI-declared endianness (default to "big" if absent)
+const iniEndian = (() => {
+  const m = rawIni.match(/^\s*endianness\s*=\s*(big|little)/mi);
+  return m ? m[1].toLowerCase() : "big";
+})();
+
+// RPM definition: rpm = scalar, U16|S16, <offset>, "label", <scale>, <translate>
 const rpmDef = (() => {
-  // Example line:
-  // rpm = scalar, U16, 6, "RPM", 1.000, 0.0
   const re = /^\s*rpm\s*=\s*scalar\s*,\s*([SU]\d+)\s*,\s*(\d+)\s*,\s*"[^"]*"\s*,\s*([+-]?\d*\.?\d+)\s*,\s*([+-]?\d*\.?\d+)/mi;
   const m = rawIni.match(re);
-  if (!m) throw new Error("Couldn't find 'rpm = scalar, ...' in the INI.");
+  if (!m) throw new Error("Couldn't find 'rpm = scalar, ...' in INI OutputChannels.");
   return {
-    type: m[1],                      // U16 / S16 (usually U16)
-    offset: parseInt(m[2], 10),      // byte offset into outpc block
-    scale: parseFloat(m[3]),         // multiply
-    translate: parseFloat(m[4])      // add
+    type: m[1],                      // U16/S16
+    offset: parseInt(m[2], 10),
+    scale: parseFloat(m[3]),
+    translate: parseFloat(m[4])
   };
 })();
 
-const DEBUG = !!args.debug;
+console.log(`[ini] ochBlockSize=${ochBlockSize}, ochGetCommand="${ochGetCmdStr}"`);
+console.log(`[ini] endianness=${iniEndian}`);
+console.log(`[ini] rpm: type=${rpmDef.type}, offset=${rpmDef.offset}, scale=${rpmDef.scale}, translate=${rpmDef.translate}`);
 
-// Util readers
-function u16be(buf, off) { return (buf[off] << 8) | buf[off + 1]; }
-function u16le(buf, off) { return (buf[off + 1] << 8) | buf[off]; }
-function s16be(buf, off) { let v = u16be(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
-function s16le(buf, off) { let v = u16le(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
-
-// Generic scalar extractor with fallback endianness check
-function readScalar16(buf, def) {
-  const signed = /^S/i.test(def.type);
-  const be = signed ? s16be(buf, def.offset) : u16be(buf, def.offset);
-  const beScaled = be * def.scale + def.translate;
-
-  // Heuristic: valid RPM should be 0..12000. If BE decode is way off, try LE.
-  if (beScaled >= 0 && beScaled <= 12000) return beScaled;
-
-  const le = signed ? s16le(buf, def.offset) : u16le(buf, def.offset);
-  const leScaled = le * def.scale + def.translate;
-  // Prefer the one that's plausible
-  if (leScaled >= 0 && leScaled <= 12000) return leScaled;
-
-  // Fall back to BE result if both are “weird” (still return something)
-  return beScaled;
-}
-
-console.log(`[ini] ochBlockSize=${ochBlockSize}, ochGetCommand="${ochGetCmdStr}"
-[ini] rpm: type=${rpmDef.type}, offset=${rpmDef.offset}`);
-
-// Decode "a\x00\x06" -> Uint8Array
+// Turn "A" or "a\x00\x06" into bytes
 function decodeEscapes(str) {
   const out = [];
   for (let i = 0; i < str.length; i++) {
@@ -113,8 +102,26 @@ function decodeEscapes(str) {
 }
 const ochGetCommandBytes = decodeEscapes(ochGetCmdStr);
 
-// Helpers
-function readU16BE(buf, off) { return (buf[off] << 8) | buf[off + 1]; }
+// ------------------ Helpers ------------------
+function u16be(buf, off){ return (buf[off] << 8) | buf[off+1]; }
+function u16le(buf, off){ return (buf[off+1] << 8) | buf[off]; }
+function s16be(buf, off){ let v = u16be(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
+function s16le(buf, off){ let v = u16le(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
+
+function plausibleRpm(v){ return v >= 400 && v <= 8000; }
+
+// Scan entire frame for LE/BE 16-bit values that look like RPM (~idle..redline)
+function findRpmCandidates(buf, limit=10){
+  const out = [];
+  for (let off = 0; off <= buf.length-2; off++){
+    const le = u16le(buf, off);
+    const be = u16be(buf, off);
+    if (plausibleRpm(le)) out.push({off, endian:"le", value:le});
+    if (plausibleRpm(be)) out.push({off, endian:"be", value:be});
+  }
+  out.sort((a,b) => Math.abs(a.value-900) - Math.abs(b.value-900));
+  return out.slice(0, limit);
+}
 
 // ------------------ Serial lifecycle ------------------
 let port = null;
@@ -127,11 +134,9 @@ let opening = false;
 
 async function autoDiscoverPort() {
   const ports = await listSerial();
-  // Prefer explicit /dev/ttyUSB*, /dev/ttyACM* if no VID/PID specified
   let candidates = ports.filter(p =>
     (p.path || "").includes("ttyUSB") || (p.path || "").includes("ttyACM")
   );
-
   if (USB_VID && USB_PID) {
     const byId = ports.filter(p =>
       (p.vendorId || "").toLowerCase() === USB_VID &&
@@ -140,8 +145,6 @@ async function autoDiscoverPort() {
     if (byId.length) return byId[0].path;
   }
   if (candidates.length) return candidates[0].path;
-
-  // Fallback: first port
   if (ports.length) return ports[0].path;
   return "";
 }
@@ -149,11 +152,8 @@ async function autoDiscoverPort() {
 async function ensurePortPath() {
   if (SERIAL_PORT) return SERIAL_PORT;
   SERIAL_PORT = await autoDiscoverPort();
-  if (!SERIAL_PORT) {
-    console.error("[serial] no serial ports found (will retry).");
-  } else {
-    console.log(`[serial] auto-discovered port: ${SERIAL_PORT}`);
-  }
+  if (!SERIAL_PORT) console.error("[serial] no serial ports found (will retry).");
+  else console.log(`[serial] auto-discovered port: ${SERIAL_PORT}`);
   return SERIAL_PORT;
 }
 
@@ -177,7 +177,6 @@ function stopPolling() {
 
 function resetPort() {
   try { if (port && port.isOpen) port.close(); } catch {}
-  // openWithRetry will be triggered by 'close' or we call it explicitly:
   openWithRetry();
 }
 
@@ -187,10 +186,9 @@ async function openWithRetry() {
 
   await ensurePortPath();
   if (!SERIAL_PORT) {
-    // No port yet—retry discovery
     opening = false;
     return setTimeout(openWithRetry, Math.min(openBackoff, MAX_BACKOFF_MS));
-  }
+    }
 
   const attemptPath = SERIAL_PORT;
   console.log(`[serial] opening ${attemptPath} @ ${BAUD} (backoff=${openBackoff}ms)`);
@@ -213,39 +211,82 @@ async function openWithRetry() {
   });
 
   port.on("data", (chunk) => {
+    lastDataTs = Date.now();
     rxBuf = Buffer.concat([rxBuf, chunk]);
-  
+
     while (rxBuf.length >= ochBlockSize) {
       const frame = rxBuf.subarray(0, ochBlockSize);
       rxBuf = rxBuf.subarray(ochBlockSize);
-  
-      // ---- DEBUG dump (once) ----
-      if (DEBUG && !lastFrame) {
-        const hex = [...frame]
-          .slice(0, 64)
-          .map(b => b.toString(16).padStart(2, "0"))
-          .join(" ");
-        console.log("[debug] first frame (first 64 bytes):", hex);
-  
-        const beRaw = (/^S/i.test(rpmDef.type) ? s16be(frame, rpmDef.offset) : u16be(frame, rpmDef.offset));
-        const leRaw = (/^S/i.test(rpmDef.type) ? s16le(frame, rpmDef.offset) : u16le(frame, rpmDef.offset));
-  
-        console.log(`[debug] rpm raw bytes @ offset=${rpmDef.offset}`);
-        console.log(`        big-endian:    ${beRaw}`);
-        console.log(`        little-endian: ${leRaw}`);
-        console.log(`        scale:         ${rpmDef.scale}`);
-        console.log(`        translate:     ${rpmDef.translate}`);
+
+      // ---- Decode RPM ----
+      let rpm;
+      const signed = /^S/i.test(rpmDef.type);
+      const readBE = signed ? s16be : u16be;
+      const readLE = signed ? s16le : u16le;
+
+      // Choose routing: override > forced endian > INI default (with plausibility fallback) > scan
+      if (RPM_OFFSET_OVERRIDE !== null) {
+        const raw = (FORCE_ENDIAN==="le") ? readLE(frame, RPM_OFFSET_OVERRIDE)
+                  : (FORCE_ENDIAN==="be") ? readBE(frame, RPM_OFFSET_OVERRIDE)
+                  : readLE(frame, RPM_OFFSET_OVERRIDE); // default to LE if unspecified when overriding
+        const scale = (RPM_SCALE_OVERRIDE!=null) ? RPM_SCALE_OVERRIDE : rpmDef.scale;
+        rpm = Math.round(raw * scale + rpmDef.translate);
+
+      } else {
+        // Start from INI offset
+        const beRaw = readBE(frame, rpmDef.offset);
+        const leRaw = readLE(frame, rpmDef.offset);
+        const beScaled = beRaw * rpmDef.scale + rpmDef.translate;
+        const leScaled = leRaw * rpmDef.scale + rpmDef.translate;
+
+        if (FORCE_ENDIAN==="le") {
+          rpm = Math.round(leScaled);
+        } else if (FORCE_ENDIAN==="be") {
+          rpm = Math.round(beScaled);
+        } else {
+          // Default to INI's endianness if plausible, else try the other, else scan
+          const iniScaled = (iniEndian === "big") ? beScaled : leScaled;
+          if (plausibleRpm(iniScaled)) {
+            rpm = Math.round(iniScaled);
+          } else if (plausibleRpm(leScaled)) {
+            rpm = Math.round(leScaled);
+            if (!globalThis._rpmEndianHint) {
+              console.log(`[hint] RPM appears little-endian at INI offset=${rpmDef.offset} (~${rpm}). You can lock with: --endian=le`);
+              globalThis._rpmEndianHint = true;
+            }
+          } else if (plausibleRpm(beScaled)) {
+            rpm = Math.round(beScaled);
+            if (!globalThis._rpmEndianHint) {
+              console.log(`[hint] RPM appears big-endian at INI offset=${rpmDef.offset} (~${rpm}). You can lock with: --endian=be`);
+              globalThis._rpmEndianHint = true;
+            }
+          } else {
+            const cands = findRpmCandidates(frame);
+            if (cands.length) {
+              const best = cands[0];
+              rpm = best.value;
+              if (!globalThis._rpmHintPrinted){
+                console.log(`[hint] RPM likely at offset=${best.off} (${best.endian.toUpperCase()}) ~ ${best.value} rpm`);
+                console.log(`       Run again with: --rpmOffset=${best.off} --endian=${best.endian}`);
+                globalThis._rpmHintPrinted = true;
+              }
+            } else {
+              rpm = 0;
+            }
+          }
+        }
       }
-  
-      // ---- Correct RPM decode using type + scale + transl. + endianness fallback ----
-      const rpm = Math.round(readScalar16(frame, rpmDef));
-  
-      lastFrame = {
-        type: "frame",
-        ts: Date.now() / 1000,
-        data: { rpm }
-      };
-  
+
+      if (DEBUG && !globalThis._dumpedOnce) {
+        const hex = [...frame].slice(0, 64).map(b => b.toString(16).padStart(2, "0")).join(" ");
+        console.log("[debug] first frame (first 64 bytes):", hex);
+        const beRaw = u16be(frame, rpmDef.offset);
+        const leRaw = u16le(frame, rpmDef.offset);
+        console.log(`[debug] rpm raw @ offset=${rpmDef.offset}: BE=${beRaw}, LE=${leRaw}, scale=${rpmDef.scale}, translate=${rpmDef.translate}`);
+        globalThis._dumpedOnce = true;
+      }
+
+      lastFrame = { type:"frame", ts: Date.now()/1000, data: { rpm } };
       broadcast(lastFrame);
     }
   });
@@ -274,8 +315,7 @@ async function openWithRetry() {
 
 function safeCloseThenRetry() {
   try { if (port && port.isOpen) port.close(); } catch {}
-  // re-discover in case tty device number changed
-  SERIAL_PORT = ""; // force rediscovery next time
+  SERIAL_PORT = ""; // force rediscovery next time (tty index can change)
   openBackoff = Math.min(openBackoff * 1.7, MAX_BACKOFF_MS);
   setTimeout(openWithRetry, openBackoff);
 }
@@ -283,7 +323,7 @@ function safeCloseThenRetry() {
 // Kick it off
 openWithRetry();
 
-// ------------------ WS server ------------------
+// ------------------ WS & HTTP ------------------
 const server = http.createServer((req, res) => {
   if (req.url === "/v1/channels") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -330,10 +370,9 @@ server.listen(WS_PORT, () => {
   console.log(`[ws] ws://localhost:${WS_PORT}/v1/stream  (channels: /v1/channels, snapshot: /v1/snapshot, health: /v1/health)`);
 });
 
-// ------------------ Hardening ------------------
+// Keep process alive on unexpected errors; reconnection logic will recover.
 process.on("uncaughtException", (e) => {
   console.error("[fatal] uncaughtException:", e);
-  // keep process alive; serial will be re-opened by timers
 });
 process.on("unhandledRejection", (e) => {
   console.error("[fatal] unhandledRejection:", e);
