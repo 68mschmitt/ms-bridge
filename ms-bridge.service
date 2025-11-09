@@ -1,0 +1,15 @@
+# /etc/systemd/system/ms-bridge.service
+[Unit]
+Description=MS2 Serial → WebSocket Bridge
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/mschmitt/projects/ms-bridge
+ExecStart=/usr/bin/node /home/mschmitt/projects/ms-bridge/ms-bridge-serial.js --ini=/home/mschmitt/projects/ms-bridge/ms2extra.ini --baud=115200 --wsport=8765
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
