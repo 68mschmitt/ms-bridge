@@ -50,13 +50,46 @@ const ochGetCmdStr = (() => {
   return m[1];
 })();
 
-// RPM definition: rpm = scalar, U16, <offset>, ...
+// ---- INI parsing for RPM (type, offset, scale, translate)
 const rpmDef = (() => {
-  const re = /^\s*rpm\s*=\s*scalar\s*,\s*([SU]\d+)\s*,\s*(\d+)\s*,/mi;
+  // Example line:
+  // rpm = scalar, U16, 6, "RPM", 1.000, 0.0
+  const re = /^\s*rpm\s*=\s*scalar\s*,\s*([SU]\d+)\s*,\s*(\d+)\s*,\s*"[^"]*"\s*,\s*([+-]?\d*\.?\d+)\s*,\s*([+-]?\d*\.?\d+)/mi;
   const m = rawIni.match(re);
-  if (!m) throw new Error("Couldn't find 'rpm = scalar, ...' in .ini OutputChannels.");
-  return { type: m[1], offset: parseInt(m[2], 10) };
+  if (!m) throw new Error("Couldn't find 'rpm = scalar, ...' in the INI.");
+  return {
+    type: m[1],                      // U16 / S16 (usually U16)
+    offset: parseInt(m[2], 10),      // byte offset into outpc block
+    scale: parseFloat(m[3]),         // multiply
+    translate: parseFloat(m[4])      // add
+  };
 })();
+
+const DEBUG = !!args.debug;
+
+// Util readers
+function u16be(buf, off) { return (buf[off] << 8) | buf[off + 1]; }
+function u16le(buf, off) { return (buf[off + 1] << 8) | buf[off]; }
+function s16be(buf, off) { let v = u16be(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
+function s16le(buf, off) { let v = u16le(buf, off); return (v & 0x8000) ? v - 0x10000 : v; }
+
+// Generic scalar extractor with fallback endianness check
+function readScalar16(buf, def) {
+  const signed = /^S/i.test(def.type);
+  const be = signed ? s16be(buf, def.offset) : u16be(buf, def.offset);
+  const beScaled = be * def.scale + def.translate;
+
+  // Heuristic: valid RPM should be 0..12000. If BE decode is way off, try LE.
+  if (beScaled >= 0 && beScaled <= 12000) return beScaled;
+
+  const le = signed ? s16le(buf, def.offset) : u16le(buf, def.offset);
+  const leScaled = le * def.scale + def.translate;
+  // Prefer the one that's plausible
+  if (leScaled >= 0 && leScaled <= 12000) return leScaled;
+
+  // Fall back to BE result if both are “weird” (still return something)
+  return beScaled;
+}
 
 console.log(`[ini] ochBlockSize=${ochBlockSize}, ochGetCommand="${ochGetCmdStr}"
 [ini] rpm: type=${rpmDef.type}, offset=${rpmDef.offset}`);
@@ -180,24 +213,39 @@ async function openWithRetry() {
   });
 
   port.on("data", (chunk) => {
-    lastDataTs = Date.now();
     rxBuf = Buffer.concat([rxBuf, chunk]);
-
+  
     while (rxBuf.length >= ochBlockSize) {
       const frame = rxBuf.subarray(0, ochBlockSize);
       rxBuf = rxBuf.subarray(ochBlockSize);
-
-      // Parse RPM (U16 BE by convention for outpc)
-      let rpm = 0;
-      if (/U16/i.test(rpmDef.type)) {
-        rpm = readU16BE(frame, rpmDef.offset);
-      } else {
-        let v = readU16BE(frame, rpmDef.offset);
-        if (v & 0x8000) v -= 0x10000;
-        rpm = v;
+  
+      // ---- DEBUG dump (once) ----
+      if (DEBUG && !lastFrame) {
+        const hex = [...frame]
+          .slice(0, 64)
+          .map(b => b.toString(16).padStart(2, "0"))
+          .join(" ");
+        console.log("[debug] first frame (first 64 bytes):", hex);
+  
+        const beRaw = (/^S/i.test(rpmDef.type) ? s16be(frame, rpmDef.offset) : u16be(frame, rpmDef.offset));
+        const leRaw = (/^S/i.test(rpmDef.type) ? s16le(frame, rpmDef.offset) : u16le(frame, rpmDef.offset));
+  
+        console.log(`[debug] rpm raw bytes @ offset=${rpmDef.offset}`);
+        console.log(`        big-endian:    ${beRaw}`);
+        console.log(`        little-endian: ${leRaw}`);
+        console.log(`        scale:         ${rpmDef.scale}`);
+        console.log(`        translate:     ${rpmDef.translate}`);
       }
-
-      lastFrame = { type:"frame", ts: Date.now()/1000, data: { rpm } };
+  
+      // ---- Correct RPM decode using type + scale + transl. + endianness fallback ----
+      const rpm = Math.round(readScalar16(frame, rpmDef));
+  
+      lastFrame = {
+        type: "frame",
+        ts: Date.now() / 1000,
+        data: { rpm }
+      };
+  
       broadcast(lastFrame);
     }
   });
