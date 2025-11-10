@@ -1,1 +1,1 @@
-python3 ms-bridge-redis.py --redis-sock /var/run/redis/redis.sock
+node ms-bridge-redis.js --redis-sock=/var/run/redis/redis.sock --channel=test
