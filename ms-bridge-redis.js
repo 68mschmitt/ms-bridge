@@ -22,9 +22,9 @@
  *   node ms-bridge-redis.js --channel=ms2:realtime --hz=20
  */
 
-const http = require('http');
-const { WebSocketServer } = require('ws');
-const Redis = require('ioredis');
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import Redis from 'ioredis';
 
 // ---------------- CLI / ENV ----------------
 const args = Object.fromEntries(
@@ -165,7 +165,7 @@ function makeRedisSubscriber() {
 const subscriber = makeRedisSubscriber();
 
 // ---------------- WS + HTTP server ----------------
-const server = http.createServer((req, res) => {
+const server = createServer((req, res) => {
   try {
     if (req.url === '/v1/channels') {
       res.writeHead(200, { 'content-type': 'application/json' });
