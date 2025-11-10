@@ -1,15 +1,38 @@
-# /etc/systemd/system/ms-bridge.service
 [Unit]
-Description=MS2 Serial → WebSocket Bridge
-After=network-online.target
+Description=MS pyEfi (Redis) → WebSocket Bridge for HUDIY
+Wants=network-online.target redis-server.service
+After=network-online.target redis-server.service
 
 [Service]
-User=pi
-WorkingDirectory=/home/mschmitt/projects/ms-bridge
-ExecStart=/usr/bin/node /home/mschmitt/projects/ms-bridge/ms-bridge-serial.js --ini=/home/mschmitt/projects/ms-bridge/ms2extra.ini --baud=115200 --wsport=8765
+# --- Adjust these two paths/user to your system ---
+User=mschmitt
+WorkingDirectory=/home/mschmitt/projects/ms-bridge/ms-bridge-redis
+
+# Environment file to tweak channel, rate, redis path, etc.
+EnvironmentFile=-/etc/default/ms-bridge-redis
+
+# ExecStart builds flags from env (see env file below)
+ExecStart=/usr/bin/node /home/mschmitt/projects/ms-bridge/ms-bridge-redis.js \
+  --wshost=${WS_HOST} --wsport=${WS_PORT} \
+  --hz=${HZ} \
+  --channel=${REDIS_CHANNEL} \
+  ${REDIS_SOCK:+--redis-sock=${REDIS_SOCK}} \
+  ${REDIS_HOST:+--redis-host=${REDIS_HOST}} \
+  ${REDIS_PORT:+--redis-port=${REDIS_PORT}}
+
 Restart=always
 RestartSec=2
 Environment=NODE_ENV=production
+# Helpful hardening:
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+# If you use a UNIX socket in /var/run/redis:
+ReadWritePaths=/var/run/redis
+
+# Increase file descriptors just in case
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target

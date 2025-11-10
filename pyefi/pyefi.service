@@ -1,0 +1,35 @@
+[Unit]
+Description=pyEfi MS2 collector supervisor
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+# >>> EDIT these paths <<<
+WorkingDirectory=/home/mschmitt/projects/pyEfi
+Environment="PYTHONUNBUFFERED=1"
+# Use your venv's python so deps are guaranteed
+ExecStart=/home/mschmitt/projects/pyefi/.venv/bin/python3 /home/mschmitt/projects/pyEfi/pyefi_supervisor.py \
+  --ini /home/pi/pyEfi/config/mainController.ini \
+  --usb /dev/ttyUSB0 \
+  --channel ms2:realtime \
+  --log-file /var/log/pyefi/collector.log
+# If you use Redis over TCP, add:
+#  --redis-host 127.0.0.1 --redis-port 6379
+
+Restart=always
+RestartSec=2
+# Ensure it has serial + redis permissions
+User=mschmitt
+Group=mschmitt
+# Give it access to /dev/ttyUSB0 (user pi should be in 'dialout') and to redis socket (often group 'redis')
+# Add: sudo usermod -aG dialout,redis pi   then log out/in
+
+# Create log directory if missing
+ExecStartPre=/usr/bin/mkdir -p /var/log/pyefi
+# Nice to have: rate-limit runaway restarts at boot
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target
